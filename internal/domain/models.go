@@ -2,18 +2,22 @@ package domain
 
 import (
 	"time"
+
 	"github.com/google/uuid"
 )
+
 // Seat status constants
 const (
 	SeatStatusAvailable = "available"
 	SeatStatusConfirmed = "confirmed"
 )
+
 // Reservation status constants
 const (
 	ReservationStatusConfirmed = "confirmed"
 	ReservationStatusCancelled = "cancelled"
 )
+
 // Show represents an event show
 type Show struct {
 	ID           uuid.UUID `json:"id"`
@@ -22,6 +26,7 @@ type Show struct {
 	PerUserLimit int       `json:"per_user_limit"`
 	CreatedAt    time.Time `json:"created_at"`
 }
+
 // Seat represents an assigned seat for a show
 type Seat struct {
 	ID         uuid.UUID `json:"id"`
@@ -32,6 +37,7 @@ type Seat struct {
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
+
 // Reservation represents a confirmed or cancelled booking
 type Reservation struct {
 	ID          uuid.UUID `json:"reservation_id"`
@@ -42,6 +48,7 @@ type Reservation struct {
 	Status      string    `json:"status"`
 	CreatedAt   time.Time `json:"created_at"`
 }
+
 // Request and Response DTOs
 type CreateShowRequest struct {
 	Name         string   `json:"name"`
