@@ -94,7 +94,7 @@ A clean checkout runs out of the box with zero external dependencies required:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/YOUR_USERNAME/seat-reservation-service.git
+git clone https://github.com/sh5800/seat-reservation-service.git
 cd seat-reservation-service
 
 # 2. Start PostgreSQL and the API service
