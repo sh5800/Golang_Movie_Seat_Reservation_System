@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"time"
 
@@ -231,6 +233,15 @@ func HashRequest(seats []string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// hashUserShow converts (userID, showID) to a 64-bit int for PostgreSQL advisory locking
+func hashUserShow(userID string, showID uuid.UUID) int64 {
+	hasher := fnv.New64a()
+	hasher.Write([]byte(userID))
+	hasher.Write([]byte(":"))
+	hasher.Write(showID[:])
+	return int64(binary.BigEndian.Uint64(hasher.Sum(nil)))
+}
+
 // ReserveSeats executes the atomic reservation workflow
 func (s *PostgresStore) ReserveSeats(
 	ctx context.Context,
@@ -238,32 +249,32 @@ func (s *PostgresStore) ReserveSeats(
 	userID string,
 	idempotencyKey string,
 	reqSeats []string,
-) (*domain.Reservation, bool, error) { // returns (res, isReplay, error)
-
+) (*domain.Reservation, bool, error) {
 	reqHash := HashRequest(reqSeats)
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	defer tx.Rollback(ctx)
-
-	// 1. Idempotency Check
+	// 1. Transaction Advisory Lock per (user, show):
+	// Guarantees strict per-user concurrency limits and serializes concurrent retries from the same user.
+	lockKey := hashUserShow(userID, showID)
+	_, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockKey)
+	if err != nil {
+		return nil, false, err
+	}
+	// 2. Idempotency Check
 	var existingHash, existingRespBody string
 	var existingStatus int
 	err = tx.QueryRow(ctx, `
 		SELECT request_hash, response_status, response_body 
 		FROM idempotency_keys 
 		WHERE user_id = $1 AND key = $2
-		FOR UPDATE
 	`, userID, idempotencyKey).Scan(&existingHash, &existingStatus, &existingRespBody)
-
 	if err == nil {
-		// Key was found
 		if existingHash != reqHash {
 			return nil, false, domain.ErrIdempotencyConflict
 		}
-		// Idempotent replay: deserialize original response
 		var replay domain.Reservation
 		if err := json.Unmarshal([]byte(existingRespBody), &replay); err != nil {
 			return nil, false, err
@@ -272,8 +283,7 @@ func (s *PostgresStore) ReserveSeats(
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, err
 	}
-
-	// 2. Fetch Show Details
+	// 3. Fetch Show Details
 	var pricePaise int64
 	var perUserLimit int
 	err = tx.QueryRow(ctx, "SELECT price_paise, per_user_limit FROM shows WHERE id = $1", showID).
@@ -284,8 +294,7 @@ func (s *PostgresStore) ReserveSeats(
 		}
 		return nil, false, err
 	}
-
-	// 3. Per-User Limit Check under Concurrency
+	// 4. Per-User Limit Check (guaranteed race-free under advisory lock)
 	var currentHeldCount int
 	err = tx.QueryRow(ctx, `
 		SELECT COALESCE(COUNT(rs.seat_id), 0)
@@ -296,78 +305,59 @@ func (s *PostgresStore) ReserveSeats(
 	if err != nil {
 		return nil, false, err
 	}
-
 	if currentHeldCount+len(reqSeats) > perUserLimit {
 		return nil, false, domain.ErrPerUserLimitExceeded
 	}
-
-	// 4. Deterministic Ordering (Deadlock-Free Row-Locking)
+	// 5. Deterministic Seat Ordering
 	sortedSeats := make([]string, len(reqSeats))
 	copy(sortedSeats, reqSeats)
 	sort.Strings(sortedSeats)
-
+	// 6. ATOMIC CONDITIONAL UPDATE:
+	// Pushes the contention check into a single atomic SQL step!
+	// Exactly 1 winner can transition the seats from 'available' to 'confirmed'.
+	cmdTag, err := tx.Exec(ctx, `
+		UPDATE seats 
+		SET status = 'confirmed', updated_at = NOW(), version = version + 1
+		WHERE show_id = $1 
+		  AND seat_number = ANY($2) 
+		  AND status = 'available'
+	`, showID, sortedSeats)
+	if err != nil {
+		return nil, false, err
+	}
+	// If rows updated != requested seats, at least one seat was already taken or invalid!
+	if cmdTag.RowsAffected() != int64(len(sortedSeats)) {
+		return nil, false, domain.ErrSeatTaken
+	}
+	// Fetch seat IDs for linking
 	rows, err := tx.Query(ctx, `
-		SELECT id, seat_number, status 
+		SELECT id 
 		FROM seats 
 		WHERE show_id = $1 AND seat_number = ANY($2)
-		ORDER BY seat_number ASC
-		FOR UPDATE
 	`, showID, sortedSeats)
 	if err != nil {
 		return nil, false, err
 	}
 	defer rows.Close()
-
-	type lockedSeat struct {
-		id         uuid.UUID
-		seatNumber string
-		status     string
-	}
-	var locked []lockedSeat
+	var seatIDs []uuid.UUID
 	for rows.Next() {
-		var ls lockedSeat
-		if err := rows.Scan(&ls.id, &ls.seatNumber, &ls.status); err != nil {
+		var sID uuid.UUID
+		if err := rows.Scan(&sID); err != nil {
 			return nil, false, err
 		}
-		locked = append(locked, ls)
+		seatIDs = append(seatIDs, sID)
 	}
-
-	// All-or-nothing check: all requested seats must exist
-	if len(locked) != len(sortedSeats) {
-		return nil, false, domain.ErrSeatTaken
-	}
-
-	// Check if any seat is already confirmed
-	seatIDs := make([]uuid.UUID, len(locked))
-	for i, ls := range locked {
-		if ls.status != domain.SeatStatusAvailable {
-			return nil, false, domain.ErrSeatTaken
-		}
-		seatIDs[i] = ls.id
-	}
-
-	// 5. Atomic State Transition to Confirmed
-	_, err = tx.Exec(ctx, `
-		UPDATE seats 
-		SET status = 'confirmed', updated_at = NOW(), version = version + 1
-		WHERE show_id = $1 AND seat_number = ANY($2)
-	`, showID, sortedSeats)
-	if err != nil {
-		return nil, false, err
-	}
-
-	// 6. Create Reservation Record (Money is integer paise!)
+	// 7. Create Reservation
 	totalAmount := pricePaise * int64(len(sortedSeats))
-	reservationID := uuid.New()
+	resID := uuid.New()
 	var res domain.Reservation
-	res.ID = reservationID
+	res.ID = resID
 	res.ShowID = showID
 	res.UserID = userID
 	res.Seats = sortedSeats
 	res.AmountPaise = totalAmount
 	res.Status = domain.ReservationStatusConfirmed
 	res.CreatedAt = time.Now().UTC()
-
 	_, err = tx.Exec(ctx, `
 		INSERT INTO reservations (id, show_id, user_id, amount_paise, status, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -375,8 +365,6 @@ func (s *PostgresStore) ReserveSeats(
 	if err != nil {
 		return nil, false, err
 	}
-
-	// Link seats in reservation_seats
 	for _, sID := range seatIDs {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO reservation_seats (reservation_id, seat_id)
@@ -386,8 +374,7 @@ func (s *PostgresStore) ReserveSeats(
 			return nil, false, err
 		}
 	}
-
-	// 7. Store Idempotency Record in the same transaction
+	// 8. Store Idempotency Record
 	respBytes, _ := json.Marshal(res)
 	_, err = tx.Exec(ctx, `
 		INSERT INTO idempotency_keys (key, user_id, show_id, request_hash, response_status, response_body)
@@ -395,17 +382,14 @@ func (s *PostgresStore) ReserveSeats(
 	`, idempotencyKey, userID, showID, reqHash, string(respBytes))
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique violation
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return nil, false, domain.ErrIdempotencyConflict
 		}
 		return nil, false, err
 	}
-
-	// Commit Transaction
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, err
 	}
-
 	return &res, false, nil
 }
 

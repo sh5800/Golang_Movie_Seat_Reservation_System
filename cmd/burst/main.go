@@ -57,6 +57,8 @@ func (s *BurstStats) Record(statusCode int, body []byte) {
 	default:
 		if statusCode >= 500 {
 			atomic.AddInt64(&s.Status5xx, 1)
+			// Print unexpected 5xx message for instant visibility
+			fmt.Printf("⚠️  5xx Error [%d]: %s\n", statusCode, string(body))
 		} else {
 			s.mu.Lock()
 			s.OtherCodes[statusCode]++
