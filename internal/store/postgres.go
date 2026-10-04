@@ -31,7 +31,7 @@ func NewPostgresStore(ctx context.Context, connString string) (*PostgresStore, e
 	}
 
 	// Connection pool tuning for high concurrency bursts
-	config.MaxConns = 50
+	config.MaxConns = 30
 	config.MinConns = 10
 	config.MaxConnLifetime = 30 * time.Minute
 	config.MaxConnIdleTime = 5 * time.Minute

@@ -78,7 +78,7 @@ func main() {
 	fmt.Println("==============================================================")
 
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 35 * time.Second,
 		Transport: &http.Transport{
 			MaxIdleConns:        2000,
 			MaxIdleConnsPerHost: 2000,
