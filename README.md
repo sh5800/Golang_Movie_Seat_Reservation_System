@@ -94,8 +94,8 @@ A clean checkout runs out of the box with zero external dependencies required:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/sh5800/seat-reservation-service.git
-cd seat-reservation-service
+git clone https://github.com/sh5800/Golang_Movie_Seat_Reservation_System.git
+cd Golang_Movie_Seat_Reservation_System
 
 # 2. Start PostgreSQL and the API service
 docker compose up --build -d
