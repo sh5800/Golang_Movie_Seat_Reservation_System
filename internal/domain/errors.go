@@ -4,6 +4,7 @@ import "errors"
 
 var (
 	ErrSeatTaken            = errors.New("seat already taken")
+	ErrSeatNotFound         = errors.New("one or more requested seats do not exist")
 	ErrPerUserLimitExceeded = errors.New("per-user booking limit exceeded")
 	ErrIdempotencyConflict  = errors.New("idempotency key conflict: payload mismatch")
 	ErrShowNotFound         = errors.New("show not found")

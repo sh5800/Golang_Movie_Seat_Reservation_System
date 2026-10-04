@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,8 +20,10 @@ type BurstStats struct {
 	Status201            int64
 	Status200Replay      int64
 	Status409Conflict    int64
+	Status400BadRequest  int64
 	Status5xx            int64
 	DeclineSeatTaken     int64
+	DeclineInvalidSeats  int64
 	DeclineUserLimit     int64
 	DeclineIdempMismatch int64
 	OtherCodes           map[int]int64
@@ -32,15 +35,19 @@ func newStats() *BurstStats {
 		OtherCodes: make(map[int]int64),
 	}
 }
-
 func (s *BurstStats) Record(statusCode int, body []byte) {
 	atomic.AddInt64(&s.TotalRequests, 1)
-
 	switch statusCode {
 	case http.StatusCreated:
 		atomic.AddInt64(&s.Status201, 1)
 	case http.StatusOK:
 		atomic.AddInt64(&s.Status200Replay, 1)
+	case http.StatusBadRequest:
+		atomic.AddInt64(&s.Status400BadRequest, 1)
+		var errResp domain.ErrorResponse
+		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Reason == "invalid-seats" {
+			atomic.AddInt64(&s.DeclineInvalidSeats, 1)
+		}
 	case http.StatusConflict:
 		atomic.AddInt64(&s.Status409Conflict, 1)
 		var errResp domain.ErrorResponse
@@ -57,7 +64,6 @@ func (s *BurstStats) Record(statusCode int, body []byte) {
 	default:
 		if statusCode >= 500 {
 			atomic.AddInt64(&s.Status5xx, 1)
-			// Print unexpected 5xx message for instant visibility
 			fmt.Printf("⚠️  5xx Error [%d]: %s\n", statusCode, string(body))
 		} else {
 			s.mu.Lock()
@@ -66,27 +72,35 @@ func (s *BurstStats) Record(statusCode int, body []byte) {
 		}
 	}
 }
-
 func main() {
 	baseURL := "http://localhost:8080"
-	if len(os.Args) > 1 {
+	if len(os.Args) > 1 && os.Args[1] != "" {
 		baseURL = os.Args[1]
 	}
-
+	concurrency := 500
+	if len(os.Args) > 2 && os.Args[2] != "" {
+		if val, err := strconv.Atoi(os.Args[2]); err == nil && val > 0 {
+			concurrency = val
+		}
+	}
+	targetSeat := "A12"
+	if len(os.Args) > 3 && os.Args[3] != "" {
+		targetSeat = os.Args[3]
+	}
 	fmt.Println("==============================================================")
 	fmt.Printf("🚀 Starting Concurrency Burst Test against: %s\n", baseURL)
+	fmt.Printf("👥 Target Concurrency: %d buyers\n", concurrency)
+	fmt.Printf("💺 Target Hot Seat   : %s\n", targetSeat)
 	fmt.Println("==============================================================")
-
 	client := &http.Client{
 		Timeout: 35 * time.Second,
 		Transport: &http.Transport{
 			MaxIdleConns:        2000,
 			MaxIdleConnsPerHost: 2000,
 			MaxConnsPerHost:     2000,
-			IdleConnTimeout:     30 * time.Second,
+			IdleConnTimeout:     60 * time.Second,
 		},
 	}
-
 	// 1. Health check verification
 	resp, err := client.Get(baseURL + "/ready")
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -95,66 +109,51 @@ func main() {
 	}
 	resp.Body.Close()
 	fmt.Println("✅ Server readiness check passed!")
-
-	// 2. Create a test show with 50 seats
+	// 2. Create a test show with 50 seats (A01 to A50)
 	seats := make([]string, 50)
 	for i := 1; i <= 50; i++ {
 		seats[i-1] = fmt.Sprintf("A%02d", i)
 	}
-
 	createShowPayload, _ := json.Marshal(domain.CreateShowRequest{
 		Name:         "burst-test-event",
 		Seats:        seats,
 		PricePaise:   25000,
 		PerUserLimit: intPtr(4),
 	})
-
 	req, _ := http.NewRequest(http.MethodPost, baseURL+"/shows", bytes.NewReader(createShowPayload))
 	req.Header.Set("Authorization", "Bearer admin-token")
 	req.Header.Set("Content-Type", "application/json")
-
 	createResp, err := client.Do(req)
 	if err != nil || createResp.StatusCode != http.StatusCreated {
 		fmt.Printf("❌ Failed to create show: %v (status: %d)\n", err, createResp.StatusCode)
 		os.Exit(1)
 	}
-
 	var show domain.CreateShowResponse
 	_ = json.NewDecoder(createResp.Body).Decode(&show)
 	createResp.Body.Close()
-
 	fmt.Printf("✅ Created test show ID: %s with %d seats (limit: %d)\n\n", show.ID, show.TotalSeats, show.PerUserLimit)
-
 	stats := newStats()
-
 	// -------------------------------------------------------------------------
-	// TEST 1: HOT SEAT STORM (500 users all racing for seat "A12" at t=0)
+	// TEST 1: HOT SEAT STORM (Concurrency racing for targetSeat at t=0)
 	// -------------------------------------------------------------------------
-	concurrency := 500
-	fmt.Printf("🔥 Storming Hot Seat 'A12' with %d concurrent buyers at t=0...\n", concurrency)
-
+	fmt.Printf("🔥 Storming Hot Seat '%s' with %d concurrent buyers at t=0...\n", targetSeat, concurrency)
 	var wg sync.WaitGroup
 	startBarrier := make(chan struct{})
-
 	for i := 1; i <= concurrency; i++ {
 		wg.Add(1)
 		go func(buyerID int) {
 			defer wg.Done()
 			payload, _ := json.Marshal(domain.ReserveRequest{
-				Seats:          []string{"A12"},
+				Seats:          []string{targetSeat},
 				IdempotencyKey: fmt.Sprintf("storm-key-%d", buyerID),
 			})
-
-			// Wait for the release barrier so all goroutines fire concurrently
 			<-startBarrier
-
 			r, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/shows/%s/reserve", baseURL, show.ID), bytes.NewReader(payload))
 			r.Header.Set("Authorization", fmt.Sprintf("Bearer buyer-%d", buyerID))
 			r.Header.Set("Content-Type", "application/json")
-
 			res, err := client.Do(r)
 			if err != nil {
-				stats.Record(599, nil)
+				stats.Record(599, []byte(err.Error()))
 				return
 			}
 			b, _ := io.ReadAll(res.Body)
@@ -162,9 +161,8 @@ func main() {
 			stats.Record(res.StatusCode, b)
 		}(i)
 	}
-
 	startTime := time.Now()
-	close(startBarrier) // FIRE all 500 requests simultaneously!
+	close(startBarrier)
 	wg.Wait()
 	duration := time.Since(startTime)
 	fmt.Printf("⏱️  Hot seat burst completed in %v\n\n", duration)

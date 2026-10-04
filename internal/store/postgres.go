@@ -327,7 +327,15 @@ func (s *PostgresStore) ReserveSeats(
 	}
 	// If rows updated != requested seats, at least one seat was already taken or invalid!
 	if cmdTag.RowsAffected() != int64(len(sortedSeats)) {
-		return nil, false, domain.ErrSeatTaken
+		var existingSeatCount int
+		_ = tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM seats 
+			WHERE show_id = $1 AND seat_number = ANY($2)
+		`, showID, sortedSeats).Scan(&existingSeatCount)
+		if existingSeatCount != len(sortedSeats) {
+			return nil, false, domain.ErrSeatNotFound // Seats don't exist in this show!
+		}
+		return nil, false, domain.ErrSeatTaken // Seats exist, but are already taken
 	}
 	// Fetch seat IDs for linking
 	rows, err := tx.Query(ctx, `
